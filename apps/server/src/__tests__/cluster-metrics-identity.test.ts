@@ -6,7 +6,7 @@ import { connectToValkey, closeMetricsServer, getMetricsNodeId } from "../connec
 import { clients, clusterNodesRegistry, clusterCredentials, metricsServerMap, startMetricsServer, __test__ } from "../metrics-orchestrator"
 import { dns } from "../utils"
 import { ensureSession, authorizeConnection, _resetSessions } from "../session"
-import { _reset as resetWatchers } from "../node-watchers"
+import { subscribe, _reset as resetWatchers } from "../node-watchers"
 import { setData } from "../actions/stats"
 import { cpuUsageRequested } from "../actions/cpuUsage"
 import { memoryUsageRequested } from "../actions/memoryUsage"
@@ -36,6 +36,9 @@ describe("cluster connection metrics identity", () => {
   let connectedNodesByCluster: Map<string, string[]>
   let standaloneCreates: number
   let clusterHosts: string[]
+  let slots: typeof SLOTS
+  let probeInfo: unknown
+  let probeInfoError: Error | undefined
 
   beforeEach(() => {
     clients.clear()
@@ -49,6 +52,9 @@ describe("cluster connection metrics identity", () => {
     connectedNodesByCluster = new Map()
     standaloneCreates = 0
     clusterHosts = []
+    slots = SLOTS
+    probeInfo = "id=1 addr=192.0.2.100:50000 laddr=" + IP + ":6379 name=probe\r\n"
+    probeInfoError = undefined
     sessionId = ensureSession({ headers: {}, socket: {} } as IncomingMessage).sessionId
     ws = { OPEN: 1, readyState: 1, send: (message: string) => messages.push(message) } as unknown as WebSocket
     mock.method(dns, "lookup", async () => [{ address: IP, family: 4 }])
@@ -60,14 +66,21 @@ describe("cluster connection metrics identity", () => {
     const standalone = {
       info: async (sections: string[]) => sections.includes(InfoOptions.Server)
         ? "valkey_version:9.0.0\r\n" : "cluster_enabled:1\r\n",
-      customCommand: async (args: string[]) => args[0] === "CLUSTER" ? SLOTS : [],
+      customCommand: async (args: string[]) => {
+        if (args[0] === "CLUSTER") return slots
+        if (args[0] === "CLIENT" && args[1] === "INFO") {
+          if (probeInfoError) throw probeInfoError
+          return probeInfo
+        }
+        return []
+      },
       configGet: async () => ({ "cluster-databases": "16" }),
       close: () => {},
     }
     // Keep instanceof meaningful so the existing-client reuse path is exercised.
     const cluster = Object.assign(Object.create(GlideClusterClient.prototype), {
       info: async () => ({ [IP]: "maxmemory_policy:noeviction\r\n" }),
-      customCommand: async (args: string[]) => args[1] === "SLOTS" ? SLOTS : [],
+      customCommand: async (args: string[]) => args[1] === "SLOTS" ? slots : [],
       configGet: async () => ({ "cluster-databases": "16" }),
       close: () => {},
     })
@@ -153,6 +166,7 @@ describe("cluster connection metrics identity", () => {
   })
 
   it("falls back to the seed when DNS fails rather than selecting an unrelated cluster node", async () => {
+    probeInfo = "id=1"
     mock.method(dns, "lookup", async () => { throw new Error("ENOTFOUND") })
     mock.method(console, "warn", () => {})
     const id = await connect()
@@ -166,6 +180,7 @@ describe("cluster connection metrics identity", () => {
   })
 
   it("does not choose arbitrarily when DNS matches multiple advertised nodes", async () => {
+    probeInfo = "id=1"
     mock.method(dns, "lookup", async () => [
       { address: IP, family: 4 }, { address: "192.0.2.11", family: 4 },
     ])
@@ -192,6 +207,119 @@ describe("cluster connection metrics identity", () => {
     assert.deepEqual(JSON.parse(fetch.mock.calls[0].arguments[1]!.body as string), { connectionId: NODE_ID })
     assert.equal(metricsServerMap.has(NODE_ID), false)
   })
+
+  for (const ipFirst of [false, true]) {
+    it("shares the advertised replica collector with its hostname, IP first: " + ipFirst, async () => {
+      const replicaIp = "192.0.2.20"
+      const replicaId = toNodeId(buildConnectionId(replicaIp, 6379))
+      slots = [[0, 16383, [IP, 6379, "primary-1"], [replicaIp, 6379, "replica-1"]]]
+      probeInfo = "id=1 laddr=" + replicaIp + ":6379"
+      mock.method(dns, "lookup", async () => [{ address: replicaIp, family: 4 }])
+      if (ipFirst) await connect(replicaIp)
+      const hostnameId = await connect("replica.example.com")
+      if (!ipFirst) await connect(replicaIp)
+      assert.equal(getMetricsNodeId(hostnameId, clients), replicaId)
+      assert.equal(getMetricsNodeId(toNodeId(hostnameId), clients), replicaId)
+      assert.equal(spawned.filter((env) => env?.VALKEY_HOST === replicaIp).length, 1)
+      assert.equal(spawned.some((env) => env?.VALKEY_HOST === "replica.example.com"), false)
+    })
+  }
+
+  for (const reuse of [false, true]) {
+    it("does not change metrics identity when a later DNS answer rotates, cached client: " + reuse, async () => {
+      if (reuse) await connect(IP)
+      let lookups = 0
+      mock.method(dns, "lookup", async () => [{
+        address: ++lookups === 1 ? IP : "192.0.2.11", family: 4,
+      }])
+      const id = await connect()
+      assert.equal(getMetricsNodeId(id, clients), NODE_ID)
+      assert.equal(lookups, 1, "collector selection must not make another DNS lookup")
+      assert.equal(spawned.some((env) => env?.VALKEY_HOST === HOST), false)
+    })
+  }
+
+  it("matches a bracketed IPv6 connected endpoint to its advertised node", async () => {
+    const ip = "2001:db8::10"
+    slots = [[0, 16383, [ip, 6379, "primary-1"]]]
+    probeInfo = "id=1 laddr=[" + ip + "]:6379"
+    const id = await connect()
+    assert.equal(getMetricsNodeId(id, clients), toNodeId(buildConnectionId(ip, 6379)))
+    assert.equal(spawned.filter((env) => env?.VALKEY_HOST === ip).length, 1)
+  })
+
+  const unavailablePeerInfo = [
+    { name: "ACL denies CLIENT INFO", response: undefined, error: new Error("NOPERM") },
+    { name: "laddr is absent", response: "id=1 addr=192.0.2.100:50000" },
+    { name: "response is not a string", response: [] },
+    { name: "address is not advertised", response: "id=1 laddr=192.0.2.99:6379" },
+    { name: "connected port does not match", response: "id=1 laddr=" + IP + ":6380" },
+  ]
+  for (const peerInfo of unavailablePeerInfo) {
+    it("retains the seed identity when " + peerInfo.name, async () => {
+      probeInfo = peerInfo.response
+      probeInfoError = peerInfo.error
+      const id = await connect()
+      assert.equal(getMetricsNodeId(id, clients), toNodeId(id))
+      assert.equal(spawned.filter((env) => env?.VALKEY_HOST === HOST).length, 1)
+    })
+  }
+
+  it("uses the connected address even if DNS returns multiple candidate nodes", async () => {
+    mock.method(dns, "lookup", async () => [
+      { address: IP, family: 4 }, { address: "192.0.2.11", family: 4 },
+    ])
+    const id = await connect()
+    assert.equal(getMetricsNodeId(id, clients), NODE_ID)
+    assert.equal(spawned.some((env) => env?.VALKEY_HOST === HOST), false)
+  })
+
+  for (const monitorCase of [
+    { name: "start", monitorAction: "start", fails: false },
+    { name: "stop", monitorAction: "stop", fails: false },
+    { name: "stop when the collector is unreachable", monitorAction: "stop", fails: true },
+    { name: "status", monitorAction: "status", fails: false },
+  ]) {
+    it("broadcasts cluster Monitor " + monitorCase.name + " to alias watchers once per socket", async () => {
+      const hostnameId = await connect()
+      const ipId = await connect(IP)
+      const clusterId = clients.get(hostnameId)!.clusterId!
+      metricsServerMap.get(NODE_ID)!.metricsURI = "http://127.0.0.1:9001"
+      const response = { monitorRunning: monitorCase.monitorAction === "start", checkAt: null, startedAt: null }
+      mock.method(globalThis, "fetch", async () => {
+        if (monitorCase.fails) throw new Error("collector unavailable")
+        return Response.json(response)
+      })
+      const aliasMessages: string[] = []
+      const sharedMessages: string[] = []
+      const unrelatedMessages: string[] = []
+      const watcher = (out: string[]) => ({ send: (message: string) => out.push(message) }) as unknown as WebSocket
+      const aliasWs = watcher(aliasMessages)
+      const sharedWs = watcher(sharedMessages)
+      subscribe(hostnameId, aliasWs)
+      for (const id of [hostnameId, ipId, NODE_ID]) {
+        subscribe(id, sharedWs)
+        subscribe(id, ws)
+      }
+      subscribe(toNodeId(buildConnectionId("192.0.2.11", 6379)), watcher(unrelatedMessages))
+      messages.length = 0
+      await monitorRequested(deps(hostnameId))(action(hostnameId, {
+        clusterId, monitorAction: monitorCase.monitorAction, targetNodeIds: [NODE_ID],
+      }))
+      assert.equal(messages.length, 1, "the requester receives one response")
+      const broadcastCount = monitorCase.monitorAction === "status" ? 0 : 1
+      assert.equal(aliasMessages.length, broadcastCount)
+      assert.equal(sharedMessages.length, broadcastCount)
+      assert.equal(unrelatedMessages.length, 0)
+      for (const message of [...messages, ...aliasMessages, ...sharedMessages]) {
+        const reply = JSON.parse(message)
+        assert.equal(reply.type, VALKEY.MONITOR.monitorFulfilled)
+        assert.equal(reply.payload.nodeId, NODE_ID)
+        assert.equal(reply.payload.clusterId, clusterId)
+        assert.deepEqual(reply.payload.parsedResponse, response)
+      }
+    })
+  }
 
   const consumers = [
     { name: "Dashboard", handler: setData, response: { info: {}, memory: {} }, type: VALKEY.STATS.setData },

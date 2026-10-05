@@ -23,6 +23,7 @@ import {
   reconcileClusterMetricsServers, 
   isKubernetes, 
   forgetCollectorKey,
+  flattenClusterNodeMap,
   ClusterNodeMap,
   type ClientMap,
   type NodeInfo } from "./metrics-orchestrator"
@@ -45,6 +46,7 @@ type ClusterCommit = {
   seedAddress: { host: string; port: number }
   discoveredClusterNodes: ClusterNodeMap
   connectionDetails: ConnectionDetails
+  metricsNodeId: string
 }
 
 type StandaloneConnectionDetails = {
@@ -243,6 +245,7 @@ async function connectToValkeyLocked(
           seedAddress: addresses[0],
           discoveredClusterNodes,
           connectionDetails: payload.connectionDetails,
+          metricsNodeId: existingConnection.metricsNodeId ?? toNodeId(connectionId),
         })
       }
       const existingStandalone = existingConnection.client as GlideClient
@@ -316,6 +319,7 @@ async function connectToValkeyLocked(
       }
 
       const { discoveredClusterNodes, clusterId } = await discoverCluster(standaloneClient, payload)
+      const metricsNodeId = await resolveClusterMetricsNodeId(addresses[0], discoveredClusterNodes, standaloneClient)
       standaloneClient.close()
 
       const existingClusterConnection = await getExistingClusterClient(discoveredClusterNodes, clients, payload.sessionId)
@@ -361,6 +365,7 @@ async function connectToValkeyLocked(
           seedAddress: addresses[0],
           discoveredClusterNodes,
           connectionDetails: payload.connectionDetails,
+          metricsNodeId,
         })
 
         if (isWebMode) {
@@ -581,16 +586,27 @@ export function getMetricsNodeId(connectionId: string, clients: ClientMap): stri
 async function resolveClusterMetricsNodeId(
   address: { host: string; port: number },
   nodes: ClusterNodeMap,
+  client: GlideClient,
 ): Promise<string> {
   const seedNodeId = toNodeId(buildConnectionId(address.host, address.port))
-  if (nodes[seedNodeId]) return seedNodeId
+  const advertisedNodes = flattenClusterNodeMap(nodes)
+  if (advertisedNodes[seedNodeId]) return seedNodeId
 
-  const { addresses } = await resolveHostnameOrIpAddress(address.host)
-  const matches = [...new Set(addresses
-    .map((host) => toNodeId(buildConnectionId(host, address.port)))
-    .filter((id) => nodes[id]))]
-  // A DNS failure or a multi-node discovery endpoint must not select an arbitrary node.
-  return matches.length === 1 ? matches[0] : seedNodeId
+  try {
+    // CLIENT INFO identifies the server endpoint of this connected seed probe.
+    // A later DNS answer (or a random cluster-client route) cannot establish it.
+    const response = await client.customCommand(["CLIENT", "INFO"])
+    if (typeof response !== "string") return seedNodeId
+    const localAddress = response.match(/(?:^|\s)laddr=(\S+)/)?.[1]
+    const matches = Object.entries(advertisedNodes).filter(([, node]) =>
+      Number(node.port) === address.port &&
+      (localAddress === node.host + ":" + node.port || localAddress === "[" + node.host + "]:" + node.port),
+    )
+    return matches.length === 1 ? matches[0][0] : seedNodeId
+  } catch {
+    // Older servers or ACLs may not expose CLIENT INFO; retain the seed collector.
+    return seedNodeId
+  }
 }
 
 async function commitClusterConnection(
@@ -599,7 +615,7 @@ async function commitClusterConnection(
   commit: ClusterCommit,
 ): Promise<GlideClusterClient> {
   const { clients, connectedNodesByCluster, clusterNodesRegistry, metricsServerMap } = ctx
-  const { clusterClient, clusterId, connectionId, seedAddress, discoveredClusterNodes, connectionDetails } = commit
+  const { clusterClient, clusterId, connectionId, seedAddress, discoveredClusterNodes, connectionDetails, metricsNodeId } = commit
 
   const [clusterSlotStatsEnabled, keyEvictionPolicy, jsonModuleAvailable, databasesCount] = await Promise.all([
     getClusterSlotStatsEnabled(clusterClient),
@@ -609,13 +625,11 @@ async function commitClusterConnection(
   ])
 
   clusterNodesRegistry.set(clusterId, discoveredClusterNodes)
-  const metricsNodeId = await resolveClusterMetricsNodeId(seedAddress, discoveredClusterNodes)
-
   if (!isKubernetes && !metricsServerMap.has(metricsNodeId)) {
-    const nodeInfo = discoveredClusterNodes[metricsNodeId] ?? connectionDetails
+    const nodeInfo = flattenClusterNodeMap(discoveredClusterNodes)[metricsNodeId]
     // The collector derives its registration ID from its host and port, so use
     // the discovered address as well as its ID. Keep the Glide seed unchanged.
-    await startMetricsServer({ ...nodeInfo, password: connectionDetails.password }, metricsNodeId)
+    await startMetricsServer({ ...connectionDetails, ...nodeInfo }, metricsNodeId)
   }
   clients.set(connectionId, { client: clusterClient, clusterId, metricsNodeId })
 
@@ -729,8 +743,8 @@ function sendClusterConnectFulfilled(ws: WebSocket, payload: ClusterConnectFulfi
 
 export async function getExistingConnection(
   payload:{connectionId: string, connectionDetails: ConnectionDetails, isRetry?: boolean, sessionId: string},
-  clients: Map<string, {client: GlideClient | GlideClusterClient, clusterId?: string}>,
-) : Promise<{ client: GlideClient | GlideClusterClient; clusterId?: string | undefined; } | undefined>
+  clients: ClientMap,
+)
 {
   const { connectionId, connectionDetails, isRetry, sessionId } = payload
   // If the frontend is retrying a broken connection, it's not a duplicate

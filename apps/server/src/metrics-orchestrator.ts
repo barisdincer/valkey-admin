@@ -145,7 +145,7 @@ export const initialConnectionDetails: ConnectionDetails = {
 const ttl = Number(process.env.TTL) || 60000
 
 // Reconciliation works on flat node ids, but cluster discovery stores replicas under their primary.
-function flattenClusterNodeMap(clusterNodeMap: ClusterNodeMap): ClusterNodeMap {
+export function flattenClusterNodeMap(clusterNodeMap: ClusterNodeMap): ClusterNodeMap {
   return Object.entries(clusterNodeMap).reduce((acc, [primaryNodeId, primaryNode]) => {
     acc[primaryNodeId] = primaryNode
 

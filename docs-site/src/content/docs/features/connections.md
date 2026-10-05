@@ -16,10 +16,11 @@ A node endpoint connects directly to a specific Valkey instance by its host and 
 After connecting, Valkey Admin checks whether the node belongs to a cluster (`cluster_enabled:1` in `INFO`). If it does, the full cluster topology is discovered automatically from that single node — you still get the complete cluster experience.
 
 You can use a node's DNS hostname even when the cluster advertises IP addresses.
-When the hostname resolves to exactly one advertised node at the same port, the
-connection shares that node's metrics collector. DNS must resolve inside the Admin
-container. If resolution fails or matches multiple nodes, the seed keeps its own
-collector rather than selecting an arbitrary node's metrics.
+When the connected seed probe's CLIENT INFO endpoint matches exactly one advertised
+primary or replica at the same port, the connection shares that node's metrics
+collector. DNS must resolve inside the Admin container. If that endpoint cannot be
+verified (including an unsupported or ACL-denied CLIENT INFO command), the seed
+keeps its own collector. Cached aliases reuse their established metrics identity.
 
 **When to use:**
 - Connecting to a standalone Valkey instance

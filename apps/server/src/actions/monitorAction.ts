@@ -57,34 +57,39 @@ export const monitorRequested = withDeps<Deps, void>(
         ? allNodeIds.filter((id) => restrictToNodeIds.includes(id))
         : allNodeIds
       const registered = targetNodeIds.filter((id) => metricsServerMap.has(id))
-      await Promise.all(registered.map((nodeId) =>
-        runMonitorForNode(ws, metricsServerMap.get(nodeId)?.metricsURI, monitorAction, { clusterId, nodeId }, nodeId),
-      ))
+      await Promise.all(registered.map((nodeId) => {
+        const watcherIds = [nodeId, ...[...clients.keys()].filter((id) => getMetricsNodeId(id, clients) === nodeId)]
+        return runMonitorForNode(ws, metricsServerMap.get(nodeId)?.metricsURI, monitorAction, { clusterId, nodeId }, watcherIds)
+      }))
     } else {
       // Standalone path. Monitor state is keyed by the db-less nodeId, so the
       // reply carries { nodeId }.
       const nodeId = toNodeId(connectionId)
       const metricsURI = metricsServerMap.get(getMetricsNodeId(connectionId, clients))?.metricsURI
-      await runMonitorForNode(ws, metricsURI, monitorAction, { nodeId }, connectionId)
+      await runMonitorForNode(ws, metricsURI, monitorAction, { nodeId }, [connectionId])
     }
   })
 
 /**
  * Issue a single node's monitor request and emit the reply.
  * @param replyId  the explicit id-space for the reply payload
- * @param watcherId the id watchers are subscribed under (db-suffixed
- *   `connectionId` on standalone, db-less `nodeId` on cluster)
+ * @param watcherIds subscription IDs for this collector, including connection aliases
  */
 async function runMonitorForNode(
   ws: WebSocket,
   metricsServerURI: string | undefined,
   monitorAction: unknown,
   replyId: NodeReplyId,
-  watcherId: string,
+  watcherIds: string[],
 ) {
   if (!metricsServerURI) {
     sendMonitorError(ws, replyId, new Error("Metrics server URI not found"))
     return
+  }
+
+  const broadcast = (response: MonitorResponse) => {
+    const watchers = new Set(watcherIds.flatMap((id) => getOtherWatchers(id, ws)))
+    watchers.forEach((watcher) => sendMonitorFulfilled(watcher, replyId, response))
   }
 
   try {
@@ -103,18 +108,14 @@ async function runMonitorForNode(
 
     // No need to broadcast on status as no state change.
     if (monitorAction === "start" || monitorAction === "stop") {
-      getOtherWatchers(watcherId, ws).forEach((watcher) => {
-        sendMonitorFulfilled(watcher, replyId, parsedResponse)
-      })
+      broadcast(parsedResponse)
     }
   } catch (error) {
     // If we were trying to stop and the metrics server is dead,
     // report monitor as stopped — it's not running anywhere.
     if (monitorAction === "stop") {
       sendMonitorFulfilled(ws, replyId, { monitorRunning: false, checkAt: null, startedAt: null })
-      getOtherWatchers(watcherId, ws).forEach((watcher) => {
-        sendMonitorFulfilled(watcher, replyId, { monitorRunning: false, checkAt: null, startedAt: null })
-      })
+      broadcast({ monitorRunning: false, checkAt: null, startedAt: null })
     } else {
       sendMonitorError(ws, replyId, error)
     }
