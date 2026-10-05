@@ -9,7 +9,7 @@
  * The relationship is N:1 (many Connection_Identifiers per metrics-node-id):
  * a metrics process is one OS process per Valkey node, and the data it
  * collects (INFO, MEMORY STATS, MONITOR, COMMANDLOG) is server-global, not
- * db-scoped. Use `toNodeId` at every boundary; never use the metrics
+ * db-scoped. Use `getMetricsNodeId` for connection aliases at every boundary; never use the metrics
  * map directly with a Connection_Identifier.
  */
 import { GlideClient, GlideClusterClient, ConnectionError, ServiceType } from "@valkey/valkey-glide"
@@ -27,12 +27,11 @@ import {
   isNodeId,
   resolveOrchestratorAuthWindowMs,
   sanitizeUrl,
-  toNodeId,
   verifyOrchestratorAuthCredential,
   mintGcpAccessToken,
   registerGcpTokenRefresh
 } from "valkey-common"
-import { discoverCluster, belongsToCluster } from "./connection"
+import { discoverCluster, belongsToCluster, getMetricsNodeId } from "./connection"
 import { ConnectionDetails } from "./actions/connection"
 import { createOrchestratorValkeyClient } from "./valkey-client"
 
@@ -61,7 +60,14 @@ export type NodeInfo = {
 
 export type ClusterNodeMap = Record<string, NodeInfo>;
 
-export const clients: Map<string, {client: GlideClient | GlideClusterClient, clusterId?: string}> = new Map()
+export type ClientMap = Map<string, {
+  client: GlideClient | GlideClusterClient
+  clusterId?: string
+  /** Advertised collector identity; the connection key retains the user's host. */
+  metricsNodeId?: string
+}>
+
+export const clients: ClientMap = new Map()
 
 export const clusterNodesRegistry: Map<string, ClusterNodeMap> = new Map()
 
@@ -472,11 +478,11 @@ async function findDiff(metricsServerMap: MetricsServerMap, clusterNodeMap: Clus
   const nodesToRemove: string[] = Array.from(metricsServerMap.entries())
     .filter(([key, value]) => {
       // `key` is a metrics-node-id. `clients` keys are Connection_Identifiers.
-      // Treat the metrics process as still-claimed if any open client strips
-      // down to this node (N:1). Avoids evicting standalone metrics whose
+      // Treat the metrics process as still-claimed if any open client resolves
+      // to this node (N:1). Avoids evicting standalone metrics whose
       // owner connection is keyed `-db<N>`.
       const knownToClients = [...clients.keys()].some(
-        (id) => toNodeId(id) === key,
+        (id) => getMetricsNodeId(id, clients) === key,
       )
       return (!clusterNodes[key] && !knownToClients) || (now - value.lastSeen) > ttl
     })
@@ -535,6 +541,7 @@ function spawnProcess(command: string, args: string[], options: SpawnOptions): C
 }
 
 export async function startMetricsServer(nodeToStart: NodeInfo, nodeId: string) {
+  if (metricsServerMap.has(nodeId)) return
   const processResourcesPath = process.env.PROCESS_RESOURCES_PATH  ?? ""
   const metricsServerPath = isElectron
     ? path.join(processResourcesPath, "server-metrics.js")

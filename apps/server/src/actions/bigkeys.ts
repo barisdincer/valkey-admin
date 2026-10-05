@@ -1,6 +1,7 @@
 import { type WebSocket } from "ws"
 import { VALKEY, type AggregateReplyId, toNodeId, buildUrl } from "valkey-common"
 import * as R from "ramda"
+import { getMetricsNodeId } from "../connection"
 import { withDeps, Deps } from "./utils"
 
 type BigKey = {
@@ -66,7 +67,7 @@ const sendBigKeysError = (
 }
 
 export const bigKeysRequested = withDeps<Deps, void>(
-  async ({ ws, metricsServerMap, action, clusterNodesRegistry }) => {
+  async ({ ws, metricsServerMap, action, clusterNodesRegistry, clients }) => {
     const { connectionId, clusterId, scanLimit, topN } = action.payload
 
     // Resolve once so every node and the merge cap use the same value.
@@ -81,7 +82,7 @@ export const bigKeysRequested = withDeps<Deps, void>(
     const nodeIds = nodes ? Object.keys(nodes) : [toNodeId(connectionId)]
 
     const promises = nodeIds.map(async (nodeId: string) => {
-      const metricsServerURI = metricsServerMap.get(nodeId)?.metricsURI
+      const metricsServerURI = metricsServerMap.get(getMetricsNodeId(nodeId, clients))?.metricsURI
       if (!metricsServerURI) {
         console.warn("Metrics server not started for node: ", nodeId)
         return { nodeId, error: "Metrics server not started" } as NodeError

@@ -6,6 +6,7 @@ import {
   toNodeId,
   buildUrl
 } from "valkey-common"
+import { getMetricsNodeId } from "../connection"
 import { Deps, withDeps, fetchWithTimeout, safeSend, type ReduxAction } from "./utils"
 import { toOutcome, type CollectionResult } from "./node-fanout"
 import { runWithRetry, type RetryRunResult, type NodeStatusUpdate } from "./retry-runner"
@@ -95,7 +96,7 @@ export const abortConfigSessionsForSocket = (ws: WebSocket): void => {
  * reply reaches the frontend.
  */
 export const runConfigPushSession = withDeps<Deps, RetryRunResult>(
-  async ({ ws, metricsServerMap, action, clusterNodesRegistry }) => {
+  async ({ ws, metricsServerMap, action, clusterNodesRegistry, clients }) => {
     const { connectionId, clusterId, config } = action.payload
 
     const replyId: AggregateReplyId =
@@ -106,7 +107,7 @@ export const runConfigPushSession = withDeps<Deps, RetryRunResult>(
       typeof clusterId === "string" ? Object.keys(clusterNodesRegistry.get(clusterId) ?? {}) : [targetId]
     const targets = targetNodeIds.map((nodeId) => ({
       nodeId,
-      metricsURI: metricsServerMap.get(nodeId)?.metricsURI,
+      metricsURI: metricsServerMap.get(getMetricsNodeId(nodeId, clients))?.metricsURI,
     }))
 
     // Supersede any in-flight session for this target.

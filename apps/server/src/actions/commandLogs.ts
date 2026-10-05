@@ -1,6 +1,7 @@
 import { type WebSocket } from "ws"
 import { VALKEY, COMMANDLOG_TYPE, type AggregateReplyId, toNodeId, buildUrl } from "valkey-common"
 import * as R from "ramda"
+import { getMetricsNodeId } from "../connection"
 import { withDeps, Deps } from "./utils"
 
 type CommandLogType = typeof COMMANDLOG_TYPE.SLOW | typeof COMMANDLOG_TYPE.LARGE_REQUEST | typeof COMMANDLOG_TYPE.LARGE_REPLY
@@ -98,7 +99,7 @@ const fetchCommandLogs = async (metricsServerURI: string, commandLogType: Comman
 }
 
 export const commandLogsRequested = withDeps<Deps, void>(
-  async ({ ws, metricsServerMap, action, clusterNodesRegistry }) => {
+  async ({ ws, metricsServerMap, action, clusterNodesRegistry, clients }) => {
     const { connectionId, clusterId } = action.payload
     const commandLogType: CommandLogType = action.payload.commandLogType as CommandLogType
     const count = Number(action.payload.count) || Number(process.env.COMMAND_LOGS_COUNT) || 100
@@ -107,7 +108,7 @@ export const commandLogsRequested = withDeps<Deps, void>(
     const nodeIds = nodes ? Object.keys(nodes) : [toNodeId(connectionId)]
 
     const promises = nodeIds.map(async (nodeId: string) => {
-      const metricsServerURI = metricsServerMap.get(nodeId)?.metricsURI
+      const metricsServerURI = metricsServerMap.get(getMetricsNodeId(nodeId, clients))?.metricsURI
       if (!metricsServerURI) {
         if (!nodes) sendCommandLogsError(ws, nodeId, new Error("Metrics server URI not found"))
         return { nodeId, error: "Metrics server not started" } as NodeError

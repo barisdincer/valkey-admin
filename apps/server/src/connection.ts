@@ -24,6 +24,7 @@ import {
   isKubernetes, 
   forgetCollectorKey,
   ClusterNodeMap,
+  type ClientMap,
   type NodeInfo } from "./metrics-orchestrator"
 import { subscribe } from "./node-watchers"
 import { clearCpuSamples } from "./node-utilization"
@@ -31,7 +32,7 @@ import { createClusterValkeyClient, createStandaloneValkeyClient } from "./valke
 import { isConnectionAuthorized } from "./session"
 
 export type ConnectionContext = {
-  clients: Map<string, { client: GlideClient | GlideClusterClient; clusterId?: string }>
+  clients: ClientMap
   connectedNodesByCluster: Map<string, string[]>
   clusterNodesRegistry: Map<string, ClusterNodeMap>
   metricsServerMap: MetricsServerMap
@@ -43,6 +44,7 @@ type ClusterCommit = {
   connectionId: string
   seedAddress: { host: string; port: number }
   discoveredClusterNodes: ClusterNodeMap
+  connectionDetails: ConnectionDetails
 }
 
 type StandaloneConnectionDetails = {
@@ -240,6 +242,7 @@ async function connectToValkeyLocked(
           connectionId,
           seedAddress: addresses[0],
           discoveredClusterNodes,
+          connectionDetails: payload.connectionDetails,
         })
       }
       const existingStandalone = existingConnection.client as GlideClient
@@ -272,15 +275,6 @@ async function connectToValkeyLocked(
     // /register back to the orchestrator and the handler checks clients.has(connectionId).
     // The finally block below ensures we close this gate on every exit path.
     clients.set(connectionId, { client: standaloneClient })
-
-    // Start metrics server for the connected node before cluster detection.
-    // The spawn is independent of the probe client and does not affect SELECT gating.
-    if (!isKubernetes) {
-      const metricsNodeId = toNodeId(connectionId)
-      if (!metricsServerMap.has(metricsNodeId)) {
-        await startMetricsServer(payload.connectionDetails, metricsNodeId)
-      }
-    }
 
     // Detect cluster mode and Server_Version on the probe BEFORE issuing any
     // `SELECT`. This is required for cluster gating: cluster nodes reject
@@ -360,17 +354,18 @@ async function connectToValkeyLocked(
         clusterCredentials.set(clusterId, payload.connectionDetails.password)
         clusterNodesRegistry.set(clusterId, discoveredClusterNodes)
 
-        if (isWebMode) {
-          reconcileClusterMetricsServers(metricsServerMap)
-        }
-
         await commitClusterConnection(ctx, ws, {
           clusterClient,
           clusterId,
           connectionId,
           seedAddress: addresses[0],
           discoveredClusterNodes,
+          connectionDetails: payload.connectionDetails,
         })
+
+        if (isWebMode) {
+          reconcileClusterMetricsServers(metricsServerMap)
+        }
 
         if (payload.isRetry && existingClusterConnection) {
           updateClusterNodesClient(clients, existingClusterConnection, clusterClient)
@@ -427,6 +422,10 @@ async function connectToValkeyLocked(
     }
 
     console.log("Connected to standalone")
+
+    if (!isKubernetes && !metricsServerMap.has(toNodeId(connectionId))) {
+      await startMetricsServer(payload.connectionDetails, toNodeId(connectionId))
+    }
 
     subscribe(payload.connectionId, ws)
 
@@ -569,7 +568,29 @@ function updateClusterNodesClient(
     console.error(`Error closing stale client for ${existingClusterConnection.clusterId}:`, error)
   }
   // Update map with new client
-  sharedIds.forEach((id) => clients.set(id, { client: newClusterClient!, clusterId: existingClusterConnection.clusterId }))
+  sharedIds.forEach((id) => clients.set(id, { ...clients.get(id)!, client: newClusterClient! }))
+}
+
+/** Resolve a connection (or its db-less UI alias) to its collector, without DNS on reads. */
+export function getMetricsNodeId(connectionId: string, clients: ClientMap): string {
+  const nodeId = toNodeId(connectionId)
+  const entry = clients.get(connectionId) ?? [...clients].find(([id]) => toNodeId(id) === nodeId)?.[1]
+  return entry?.metricsNodeId ?? nodeId
+}
+
+async function resolveClusterMetricsNodeId(
+  address: { host: string; port: number },
+  nodes: ClusterNodeMap,
+): Promise<string> {
+  const seedNodeId = toNodeId(buildConnectionId(address.host, address.port))
+  if (nodes[seedNodeId]) return seedNodeId
+
+  const { addresses } = await resolveHostnameOrIpAddress(address.host)
+  const matches = [...new Set(addresses
+    .map((host) => toNodeId(buildConnectionId(host, address.port)))
+    .filter((id) => nodes[id]))]
+  // A DNS failure or a multi-node discovery endpoint must not select an arbitrary node.
+  return matches.length === 1 ? matches[0] : seedNodeId
 }
 
 async function commitClusterConnection(
@@ -577,8 +598,8 @@ async function commitClusterConnection(
   ws: WebSocket,
   commit: ClusterCommit,
 ): Promise<GlideClusterClient> {
-  const { clients, connectedNodesByCluster, clusterNodesRegistry } = ctx
-  const { clusterClient, clusterId, connectionId, seedAddress, discoveredClusterNodes } = commit
+  const { clients, connectedNodesByCluster, clusterNodesRegistry, metricsServerMap } = ctx
+  const { clusterClient, clusterId, connectionId, seedAddress, discoveredClusterNodes, connectionDetails } = commit
 
   const [clusterSlotStatsEnabled, keyEvictionPolicy, jsonModuleAvailable, databasesCount] = await Promise.all([
     getClusterSlotStatsEnabled(clusterClient),
@@ -588,7 +609,15 @@ async function commitClusterConnection(
   ])
 
   clusterNodesRegistry.set(clusterId, discoveredClusterNodes)
-  clients.set(connectionId, { client: clusterClient, clusterId })
+  const metricsNodeId = await resolveClusterMetricsNodeId(seedAddress, discoveredClusterNodes)
+
+  if (!isKubernetes && !metricsServerMap.has(metricsNodeId)) {
+    const nodeInfo = discoveredClusterNodes[metricsNodeId] ?? connectionDetails
+    // The collector derives its registration ID from its host and port, so use
+    // the discovered address as well as its ID. Keep the Glide seed unchanged.
+    await startMetricsServer({ ...nodeInfo, password: connectionDetails.password }, metricsNodeId)
+  }
+  clients.set(connectionId, { client: clusterClient, clusterId, metricsNodeId })
 
   const nodes = connectedNodesByCluster.get(clusterId)
   if (nodes === undefined) connectedNodesByCluster.set(clusterId, [connectionId])
@@ -734,19 +763,19 @@ export async function getExistingConnection(
 export async function closeMetricsServer(
   connectionId: string,
   metricsServerMap: MetricsServerMap,
-  clients: Map<string, { client: GlideClient | GlideClusterClient; clusterId?: string }>,
+  clients: ClientMap,
 ) {
   // Map Connection_Identifier → metrics-node-id at the boundary.
-  const nodeId = toNodeId(connectionId)
+  const nodeId = getMetricsNodeId(connectionId, clients)
 
   // N:1 invariant: many user-visible connections may share one metrics
   // process for the same (host, port). Only close when this is the LAST
   // sibling, otherwise we'd orphan still-active dbs on the same node.
   // The `id !== connectionId` guard tolerates callers that haven't yet
-  // removed `connectionId` from `clients`; teardownConnection currently
-  // removes first, so this is belt-and-suspenders.
+  // removed `connectionId` from `clients`. Teardown resolves the collector
+  // before removing the alias entry.
   const stillReferenced = [...clients.keys()].some(
-    (id) => id !== connectionId && toNodeId(id) === nodeId,
+    (id) => id !== connectionId && getMetricsNodeId(id, clients) === nodeId,
   )
   if (stillReferenced) return
 

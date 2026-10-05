@@ -1,5 +1,6 @@
 import { type WebSocket } from "ws"
 import { VALKEY, type MonitorAction, type NodeReplyId, toNodeId, buildUrl } from "valkey-common"
+import { getMetricsNodeId } from "../connection"
 import { withDeps, type Deps, fetchWithTimeout } from "./utils"
 import { getOtherWatchers } from "../node-watchers"
 
@@ -44,7 +45,7 @@ const sendMonitorError = (
 }
 
 export const monitorRequested = withDeps<Deps, void>(
-  async ({ ws, metricsServerMap, action, clusterNodesRegistry }) => {
+  async ({ ws, metricsServerMap, action, clusterNodesRegistry, clients }) => {
     const { connectionId, clusterId, monitorAction } = action.payload
     // Internal restriction used by the save flow to toggle only the nodes
     // whose config push succeeded.
@@ -63,7 +64,8 @@ export const monitorRequested = withDeps<Deps, void>(
       // Standalone path. Monitor state is keyed by the db-less nodeId, so the
       // reply carries { nodeId }.
       const nodeId = toNodeId(connectionId)
-      await runMonitorForNode(ws, metricsServerMap.get(nodeId)?.metricsURI, monitorAction, { nodeId }, connectionId)
+      const metricsURI = metricsServerMap.get(getMetricsNodeId(connectionId, clients))?.metricsURI
+      await runMonitorForNode(ws, metricsURI, monitorAction, { nodeId }, connectionId)
     }
   })
 

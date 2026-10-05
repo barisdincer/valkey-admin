@@ -1,6 +1,7 @@
 import { type WebSocket } from "ws"
 import { VALKEY, type AggregateReplyId, toNodeId, buildUrl } from "valkey-common"
 import * as R from "ramda"
+import { getMetricsNodeId } from "../connection"
 import { withDeps, Deps } from "./utils"
 
 type HotKeysResponse = {
@@ -52,7 +53,7 @@ const sendHotKeysError = (
 }
 
 export const hotKeysRequested = withDeps<Deps, void>(
-  async ({ ws, metricsServerMap, action, clusterNodesRegistry }) => {
+  async ({ ws, metricsServerMap, action, clusterNodesRegistry, clients }) => {
     const { connectionId, clusterId, lfuEnabled, clusterSlotStatsEnabled } = action.payload
     const count = Number(action.payload.count) || Number(process.env.HOT_KEYS_COUNT) || 50
 
@@ -64,7 +65,7 @@ export const hotKeysRequested = withDeps<Deps, void>(
     const nodeIds = nodes ? Object.keys(nodes) : [toNodeId(connectionId)]
 
     const promises = nodeIds.map(async (nodeId: string) => {
-      const metricsServerURI = metricsServerMap.get(nodeId)?.metricsURI
+      const metricsServerURI = metricsServerMap.get(getMetricsNodeId(nodeId, clients))?.metricsURI
       if (!metricsServerURI) {
         console.warn("Metrics server not started for node: ", nodeId)
         return { nodeId, error: "Metrics server not started" } as NodeError
